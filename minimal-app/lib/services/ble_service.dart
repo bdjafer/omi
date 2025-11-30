@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:collection/collection.dart';
@@ -18,6 +19,7 @@ class BleService {
   StreamSubscription? _scanSubscription;
   OmiDevice? _connectedDevice;
   OmiDevice? get connectedDevice => _connectedDevice;
+  String? _lastConnectedDeviceId;
   DeviceConnectionState _connectionState = DeviceConnectionState.disconnected;
   DeviceConnectionState get connectionState => _connectionState;
   final _connectionStateController = StreamController<DeviceConnectionState>.broadcast();
@@ -30,6 +32,11 @@ class BleService {
   final _batteryController = StreamController<int>.broadcast();
   Stream<int> get batteryStream => _batteryController.stream;
   StreamSubscription? _batterySubscription;
+  Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+  static const int _maxReconnectAttempts = 15;
+  bool _shouldReconnect = false;
+  Timer? _connectionWatchdog;
 
   Future<bool> isBluetoothOn() async {
     final state = await FlutterBluePlus.adapterState.first;
@@ -65,6 +72,13 @@ class BleService {
   }
 
   Future<bool> connect(OmiDevice device) async {
+    _lastConnectedDeviceId = device.id;
+    _shouldReconnect = true;
+    _reconnectAttempts = 0;
+    return await _connectToDevice(device);
+  }
+
+  Future<bool> _connectToDevice(OmiDevice device) async {
     try {
       _updateConnectionState(DeviceConnectionState.connecting);
       _deviceConnectionSubscription?.cancel();
@@ -73,25 +87,82 @@ class BleService {
           _handleDisconnection();
         }
       });
-      await device.bleDevice.connect();
-      await device.bleDevice.connectionState.where((s) => s == BluetoothConnectionState.connected).first;
+      await device.bleDevice.connect(autoConnect: false, timeout: const Duration(seconds: 15));
+      await device.bleDevice.connectionState.where((s) => s == BluetoothConnectionState.connected).first.timeout(const Duration(seconds: 10));
       if (Platform.isAndroid) {
         await device.bleDevice.requestMtu(512);
+        await device.bleDevice.requestConnectionPriority(connectionPriorityRequest: ConnectionPriority.high);
       }
       _services = await device.bleDevice.discoverServices();
       _connectedDevice = device;
+      _reconnectAttempts = 0;
       await _readDeviceInfo();
       _updateConnectionState(DeviceConnectionState.connected);
       _startBatteryListener();
+      _startConnectionWatchdog();
+      print('BLE connected to ${device.name}');
       return true;
     } catch (e) {
-      print('Connection error: $e');
+      print('BLE connection error: $e');
       _updateConnectionState(DeviceConnectionState.disconnected);
+      if (_shouldReconnect) _scheduleReconnect();
       return false;
     }
   }
 
+  void _startConnectionWatchdog() {
+    _connectionWatchdog?.cancel();
+    _connectionWatchdog = Timer.periodic(const Duration(seconds: 30), (_) async {
+      if (_connectedDevice != null && _connectionState == DeviceConnectionState.connected) {
+        try {
+          final isConnected = _connectedDevice!.bleDevice.isConnected;
+          if (!isConnected) {
+            print('Watchdog: Device disconnected, triggering reconnect');
+            _handleDisconnection();
+          }
+        } catch (e) {
+          print('Watchdog error: $e');
+        }
+      }
+    });
+  }
+
+  void _handleDisconnection() {
+    print('BLE disconnected');
+    _connectionWatchdog?.cancel();
+    _audioSubscription?.cancel();
+    _audioSubscription = null;
+    _batterySubscription?.cancel();
+    _batterySubscription = null;
+    final wasConnected = _connectionState == DeviceConnectionState.connected || _connectionState == DeviceConnectionState.streaming;
+    _connectedDevice = null;
+    _services = [];
+    _updateConnectionState(DeviceConnectionState.disconnected);
+    if (_shouldReconnect && wasConnected) _scheduleReconnect();
+  }
+
+  void _scheduleReconnect() {
+    if (!_shouldReconnect || _reconnectAttempts >= _maxReconnectAttempts || _lastConnectedDeviceId == null) {
+      print('BLE: Max retries reached or reconnect disabled');
+      return;
+    }
+    _reconnectTimer?.cancel();
+    final delay = Duration(milliseconds: min(2000 * pow(1.3, _reconnectAttempts).toInt(), 60000));
+    print('BLE: Reconnecting in ${delay.inSeconds}s (attempt ${_reconnectAttempts + 1}/$_maxReconnectAttempts)');
+    _reconnectTimer = Timer(delay, () async {
+      _reconnectAttempts++;
+      if (_lastConnectedDeviceId != null) {
+        final bleDevice = BluetoothDevice.fromId(_lastConnectedDeviceId!);
+        final device = OmiDevice(id: _lastConnectedDeviceId!, name: 'OMI Device', rssi: 0, bleDevice: bleDevice);
+        await _connectToDevice(device);
+      }
+    });
+  }
+
   Future<void> disconnect() async {
+    _shouldReconnect = false;
+    _reconnectTimer?.cancel();
+    _connectionWatchdog?.cancel();
     _audioSubscription?.cancel();
     _audioSubscription = null;
     _batterySubscription?.cancel();
@@ -102,19 +173,9 @@ class BleService {
       try {
         await _connectedDevice!.bleDevice.disconnect();
       } catch (e) {
-        print('Disconnect error: $e');
+        print('BLE disconnect error: $e');
       }
     }
-    _connectedDevice = null;
-    _services = [];
-    _updateConnectionState(DeviceConnectionState.disconnected);
-  }
-
-  void _handleDisconnection() {
-    _audioSubscription?.cancel();
-    _audioSubscription = null;
-    _batterySubscription?.cancel();
-    _batterySubscription = null;
     _connectedDevice = null;
     _services = [];
     _updateConnectionState(DeviceConnectionState.disconnected);
@@ -128,29 +189,21 @@ class BleService {
   Future<void> _readDeviceInfo() async {
     if (_connectedDevice == null) return;
     final codecData = await _readCharacteristic(omiServiceUuid, audioCodecCharacteristicUuid);
-    if (codecData.isNotEmpty) {
-      _connectedDevice!.codec = BleAudioCodec.fromId(codecData[0]);
-    }
+    if (codecData.isNotEmpty) _connectedDevice!.codec = BleAudioCodec.fromId(codecData[0]);
     final batteryData = await _readCharacteristic(batteryServiceUuid, batteryLevelCharacteristicUuid);
     if (batteryData.isNotEmpty) {
       _connectedDevice!.batteryLevel = batteryData[0];
       _batteryController.add(batteryData[0]);
     }
     final firmwareData = await _readCharacteristic(deviceInformationServiceUuid, firmwareRevisionCharacteristicUuid);
-    if (firmwareData.isNotEmpty) {
-      _connectedDevice!.firmwareVersion = String.fromCharCodes(firmwareData);
-    }
+    if (firmwareData.isNotEmpty) _connectedDevice!.firmwareVersion = String.fromCharCodes(firmwareData);
   }
 
   Future<List<int>> _readCharacteristic(String serviceUuid, String charUuid) async {
     try {
-      final service = _services.firstWhereOrNull(
-        (s) => s.uuid.str128.toLowerCase() == serviceUuid.toLowerCase(),
-      );
+      final service = _services.firstWhereOrNull((s) => s.uuid.str128.toLowerCase() == serviceUuid.toLowerCase());
       if (service == null) return [];
-      final char = service.characteristics.firstWhereOrNull(
-        (c) => c.uuid.str128.toLowerCase() == charUuid.toLowerCase(),
-      );
+      final char = service.characteristics.firstWhereOrNull((c) => c.uuid.str128.toLowerCase() == charUuid.toLowerCase());
       if (char == null) return [];
       return await char.read();
     } catch (e) {
@@ -161,13 +214,9 @@ class BleService {
 
   void _startBatteryListener() async {
     try {
-      final service = _services.firstWhereOrNull(
-        (s) => s.uuid.str128.toLowerCase() == batteryServiceUuid.toLowerCase(),
-      );
+      final service = _services.firstWhereOrNull((s) => s.uuid.str128.toLowerCase() == batteryServiceUuid.toLowerCase());
       if (service == null) return;
-      final char = service.characteristics.firstWhereOrNull(
-        (c) => c.uuid.str128.toLowerCase() == batteryLevelCharacteristicUuid.toLowerCase(),
-      );
+      final char = service.characteristics.firstWhereOrNull((c) => c.uuid.str128.toLowerCase() == batteryLevelCharacteristicUuid.toLowerCase());
       if (char == null) return;
       await char.setNotifyValue(true);
       _batterySubscription = char.lastValueStream.listen((value) {
@@ -184,25 +233,19 @@ class BleService {
   Future<void> startAudioStream() async {
     if (_connectedDevice == null || _connectionState != DeviceConnectionState.connected) return;
     try {
-      final service = _services.firstWhereOrNull(
-        (s) => s.uuid.str128.toLowerCase() == omiServiceUuid.toLowerCase(),
-      );
+      final service = _services.firstWhereOrNull((s) => s.uuid.str128.toLowerCase() == omiServiceUuid.toLowerCase());
       if (service == null) {
         print('OMI service not found');
         return;
       }
-      final char = service.characteristics.firstWhereOrNull(
-        (c) => c.uuid.str128.toLowerCase() == audioDataStreamCharacteristicUuid.toLowerCase(),
-      );
+      final char = service.characteristics.firstWhereOrNull((c) => c.uuid.str128.toLowerCase() == audioDataStreamCharacteristicUuid.toLowerCase());
       if (char == null) {
         print('Audio characteristic not found');
         return;
       }
       await char.setNotifyValue(true);
       _audioSubscription = char.lastValueStream.listen((value) {
-        if (value.isNotEmpty) {
-          _audioDataController.add(value);
-        }
+        if (value.isNotEmpty) _audioDataController.add(value);
       });
       _updateConnectionState(DeviceConnectionState.streaming);
       print('Audio stream started');
@@ -214,15 +257,16 @@ class BleService {
   Future<void> stopAudioStream() async {
     _audioSubscription?.cancel();
     _audioSubscription = null;
-    if (_connectionState == DeviceConnectionState.streaming) {
-      _updateConnectionState(DeviceConnectionState.connected);
-    }
+    if (_connectionState == DeviceConnectionState.streaming) _updateConnectionState(DeviceConnectionState.connected);
     print('Audio stream stopped');
   }
 
   BleAudioCodec? get currentCodec => _connectedDevice?.codec;
 
   void dispose() {
+    _shouldReconnect = false;
+    _reconnectTimer?.cancel();
+    _connectionWatchdog?.cancel();
     _scanSubscription?.cancel();
     _audioSubscription?.cancel();
     _batterySubscription?.cancel();
@@ -233,4 +277,3 @@ class BleService {
     _batteryController.close();
   }
 }
-

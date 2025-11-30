@@ -4,6 +4,7 @@ import '../models/omi_device.dart';
 import '../services/ble_service.dart';
 import '../services/websocket_service.dart';
 import '../services/audio_streamer.dart';
+import '../services/foreground_service.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -15,7 +16,8 @@ class _HomePageState extends State<HomePage> {
   final BleService _bleService = BleService();
   final WebSocketService _wsService = WebSocketService();
   final AudioStreamer _audioStreamer = AudioStreamer();
-  final TextEditingController _serverController = TextEditingController(text: 'ws://10.0.2.2:8000');
+  final ForegroundServiceManager _foregroundService = ForegroundServiceManager();
+  final TextEditingController _serverController = TextEditingController(text: 'wss://739c26ef1c8b.ngrok-free.app');
   List<OmiDevice> _devices = [];
   DeviceConnectionState _connectionState = DeviceConnectionState.disconnected;
   WebSocketState _wsState = WebSocketState.disconnected;
@@ -23,12 +25,7 @@ class _HomePageState extends State<HomePage> {
   bool _isStreaming = false;
   int _batteryLevel = -1;
   int _bytesSent = 0;
-  StreamSubscription? _devicesSubscription;
-  StreamSubscription? _connectionSubscription;
-  StreamSubscription? _wsStateSubscription;
-  StreamSubscription? _streamingSubscription;
-  StreamSubscription? _batterySubscription;
-  StreamSubscription? _bytesSubscription;
+  final List<StreamSubscription> _subscriptions = [];
 
   @override
   void initState() {
@@ -37,34 +34,35 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _setupListeners() {
-    _devicesSubscription = _bleService.devicesStream.listen((devices) {
-      setState(() => _devices = devices);
-    });
-    _connectionSubscription = _bleService.connectionStateStream.listen((state) {
+    _subscriptions.add(_bleService.devicesStream.listen((devices) => setState(() => _devices = devices)));
+    _subscriptions.add(_bleService.connectionStateStream.listen((state) {
       setState(() => _connectionState = state);
-    });
-    _wsStateSubscription = _wsService.stateStream.listen((state) {
+      _updateNotification();
+    }));
+    _subscriptions.add(_wsService.stateStream.listen((state) {
       setState(() => _wsState = state);
-    });
-    _streamingSubscription = _audioStreamer.streamingStream.listen((streaming) {
+      _updateNotification();
+    }));
+    _subscriptions.add(_audioStreamer.streamingStream.listen((streaming) {
       setState(() => _isStreaming = streaming);
-    });
-    _batterySubscription = _bleService.batteryStream.listen((level) {
-      setState(() => _batteryLevel = level);
-    });
-    _bytesSubscription = _wsService.bytesStream.listen((bytes) {
-      setState(() => _bytesSent = bytes);
-    });
+      _updateNotification();
+    }));
+    _subscriptions.add(_bleService.batteryStream.listen((level) => setState(() => _batteryLevel = level)));
+    _subscriptions.add(_wsService.bytesStream.listen((bytes) => setState(() => _bytesSent = bytes)));
+  }
+
+  void _updateNotification() {
+    if (_isStreaming) {
+      final status = _wsState == WebSocketState.connected ? 'Connected' : 'Reconnecting...';
+      _foregroundService.updateNotification('Streaming - $status - ${_formatBytes(_bytesSent)}');
+    }
   }
 
   @override
   void dispose() {
-    _devicesSubscription?.cancel();
-    _connectionSubscription?.cancel();
-    _wsStateSubscription?.cancel();
-    _streamingSubscription?.cancel();
-    _batterySubscription?.cancel();
-    _bytesSubscription?.cancel();
+    for (final sub in _subscriptions) {
+      sub.cancel();
+    }
     _serverController.dispose();
     super.dispose();
   }
@@ -83,17 +81,19 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _disconnect() async {
-    if (_isStreaming) await _audioStreamer.stopStreaming();
+    if (_isStreaming) await _stopStreaming();
     await _bleService.disconnect();
   }
 
-  Future<void> _toggleStreaming() async {
-    if (_isStreaming) {
-      await _audioStreamer.stopStreaming();
-    } else {
-      _wsService.setServerUrl(_serverController.text);
-      await _audioStreamer.startStreaming();
-    }
+  Future<void> _startStreaming() async {
+    _wsService.setServerUrl(_serverController.text);
+    await _foregroundService.start();
+    await _audioStreamer.startStreaming();
+  }
+
+  Future<void> _stopStreaming() async {
+    await _audioStreamer.stopStreaming();
+    await _foregroundService.stop();
   }
 
   String _formatBytes(int bytes) {
@@ -105,10 +105,7 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Minimal OMI'),
-        centerTitle: true,
-      ),
+      appBar: AppBar(title: const Text('Minimal OMI'), centerTitle: true),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -118,13 +115,7 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(height: 16),
             _buildConnectionStatus(),
             const SizedBox(height: 16),
-            if (_connectionState == DeviceConnectionState.disconnected) ...[
-              _buildScanSection(),
-            ] else ...[
-              _buildDeviceInfo(),
-              const SizedBox(height: 16),
-              _buildStreamingSection(),
-            ],
+            if (_connectionState == DeviceConnectionState.disconnected) _buildScanSection() else ...[_buildDeviceInfo(), const SizedBox(height: 16), _buildStreamingSection()],
           ],
         ),
       ),
@@ -138,17 +129,15 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Backend Server', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const Text('Backend Server (WebSocket)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             TextField(
               controller: _serverController,
-              decoration: const InputDecoration(
-                hintText: 'ws://localhost:8000',
-                border: OutlineInputBorder(),
-                isDense: true,
-              ),
+              decoration: const InputDecoration(hintText: 'wss://739c26ef1c8b.ngrok-free.app', border: OutlineInputBorder(), isDense: true),
               enabled: !_isStreaming,
             ),
+            const SizedBox(height: 8),
+            Text('Use wss:// for ngrok, ws:// for local', style: TextStyle(fontSize: 12, color: Colors.grey[400])),
           ],
         ),
       ),
@@ -158,15 +147,24 @@ class _HomePageState extends State<HomePage> {
   Widget _buildConnectionStatus() {
     final deviceConnected = _connectionState != DeviceConnectionState.disconnected;
     final wsConnected = _wsState == WebSocketState.connected;
+    final wsConnecting = _wsState == WebSocketState.connecting;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
+        child: Column(
           children: [
-            _buildStatusIndicator('Device', deviceConnected, _connectionState == DeviceConnectionState.connecting),
-            _buildStatusIndicator('WebSocket', wsConnected, _wsState == WebSocketState.connecting),
-            _buildStatusIndicator('Streaming', _isStreaming, false),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _buildStatusIndicator('BLE Device', deviceConnected, _connectionState == DeviceConnectionState.connecting),
+                _buildStatusIndicator('WebSocket', wsConnected, wsConnecting),
+                _buildStatusIndicator('Streaming', _isStreaming, false),
+              ],
+            ),
+            if (_isStreaming && !wsConnected) ...[
+              const SizedBox(height: 8),
+              Text('WebSocket reconnecting...', style: TextStyle(color: Colors.orange[300], fontSize: 12)),
+            ],
           ],
         ),
       ),
@@ -179,11 +177,7 @@ class _HomePageState extends State<HomePage> {
         if (loading)
           const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
         else
-          Icon(
-            active ? Icons.check_circle : Icons.cancel,
-            color: active ? Colors.green : Colors.red,
-            size: 24,
-          ),
+          Icon(active ? Icons.check_circle : Icons.cancel, color: active ? Colors.green : Colors.red, size: 24),
         const SizedBox(height: 4),
         Text(label, style: const TextStyle(fontSize: 12)),
       ],
@@ -203,9 +197,7 @@ class _HomePageState extends State<HomePage> {
                 const Text('Scan for OMI Devices', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                 ElevatedButton.icon(
                   onPressed: _isScanning ? null : _startScan,
-                  icon: _isScanning
-                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Icon(Icons.bluetooth_searching),
+                  icon: _isScanning ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.bluetooth_searching),
                   label: Text(_isScanning ? 'Scanning...' : 'Scan'),
                 ),
               ],
@@ -224,10 +216,7 @@ class _HomePageState extends State<HomePage> {
                     leading: const Icon(Icons.bluetooth),
                     title: Text(device.name),
                     subtitle: Text('RSSI: ${device.rssi} dBm'),
-                    trailing: ElevatedButton(
-                      onPressed: () => _connectDevice(device),
-                      child: const Text('Connect'),
-                    ),
+                    trailing: ElevatedButton(onPressed: () => _connectDevice(device), child: const Text('Connect')),
                   );
                 },
               ),
@@ -270,13 +259,7 @@ class _HomePageState extends State<HomePage> {
   Widget _buildInfoRow(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: const TextStyle(color: Colors.grey)),
-          Text(value),
-        ],
-      ),
+      child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text(label, style: const TextStyle(color: Colors.grey)), Text(value)]),
     );
   }
 
@@ -290,19 +273,27 @@ class _HomePageState extends State<HomePage> {
             const Text('Audio Streaming', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 16),
             if (_isStreaming) ...[
-              _buildInfoRow('Status', 'Streaming'),
+              _buildInfoRow('Status', _wsState == WebSocketState.connected ? 'Streaming' : 'Reconnecting...'),
               _buildInfoRow('Bytes Sent', _formatBytes(_bytesSent)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: Colors.green.withOpacity(0.2), borderRadius: BorderRadius.circular(8)),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline, size: 16, color: Colors.green),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text('Running in background. Will auto-reconnect if disconnected.', style: TextStyle(fontSize: 12, color: Colors.green[300]))),
+                  ],
+                ),
+              ),
               const SizedBox(height: 16),
             ],
             ElevatedButton.icon(
-              onPressed: _connectionState == DeviceConnectionState.connected || _isStreaming ? _toggleStreaming : null,
+              onPressed: _connectionState == DeviceConnectionState.connected || _connectionState == DeviceConnectionState.streaming || _isStreaming ? (_isStreaming ? _stopStreaming : _startStreaming) : null,
               icon: Icon(_isStreaming ? Icons.stop : Icons.play_arrow),
               label: Text(_isStreaming ? 'Stop Streaming' : 'Start Streaming'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _isStreaming ? Colors.red : Colors.green,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 16),
-              ),
+              style: ElevatedButton.styleFrom(backgroundColor: _isStreaming ? Colors.red : Colors.green, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 16)),
             ),
           ],
         ),
@@ -310,4 +301,3 @@ class _HomePageState extends State<HomePage> {
     );
   }
 }
-
